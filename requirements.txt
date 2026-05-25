@@ -1,0 +1,27 @@
+requests>=2.31
+beautifulsoup4>=4.12
+cloudscraper>=1.2.71
+aiohttp>=3.9
+aiodns>=3.1
+aiosmtplib>=2.0
+tqdm>=4.66
+tld>=0.13
+python-socks[asyncio]>=2.4
+urllib3>=1.26
+# Tier-1 stealth: Chrome 120 TLS+JA3 impersonation. Beats Cloudflare browser
+# checks and reCAPTCHA v3 fingerprint scoring on most sites without spawning
+# a browser. Optional but strongly recommended; falls back to cloudscraper if
+# missing (the prior path).
+curl_cffi>=0.7
+# Selenium / webdriver-manager are only needed when --selenium is passed.
+# Install with: pip install selenium webdriver-manager
+#
+# Tier-2 stealth (optional): camoufox is a stealth-Firefox fork that solves
+# Cloudflare Turnstile natively. Only loaded when --browser-fallback is
+# passed. Heavyweight (downloads a Firefox binary on first run).
+# Install with: pip install camoufox && python -m camoufox fetch
+#
+# PR #6 optional: openpyxl powers --xlsx (multi-sheet workbook with
+# conditional formatting on the verifier sheet). Silently skipped if
+# missing -- not required for any other functionality.
+# Install with: pip install openpyxl
