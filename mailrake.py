@@ -1573,6 +1573,13 @@ class AsyncEmailVerifier:
         self.direct_mail_from = f"{self.settings.get('direct_check_user', 'unknown')}@{self.settings.get('direct_check_host', 'unknown')}"
         self.proxies = proxies or []
         self.proxy_cycle = deque(self.proxies)
+        # Per-proxy strike tracking for the SMTP verifier. Mirrors the
+        # crawler's _proxy_strikes so a proxy that fails to connect for
+        # one email is deprioritised for the next, rather than pure
+        # round-robin retrying it on every attempt.
+        self._proxy_strikes: Dict[str, int] = {}
+        self._dead_proxy_strikes: int = 3
+        self.lock = threading.RLock()
         # Cache one resolver per verifier instance to avoid recreating it for
         # every MX lookup (was: one DNSResolver per call, leaking sockets).
         self._resolver: Optional[aiodns.DNSResolver] = None
@@ -1674,9 +1681,30 @@ class AsyncEmailVerifier:
     def _get_next_proxy(self):
         if not self.proxy_cycle:
             return None
-        proxy = self.proxy_cycle[0]
-        self.proxy_cycle.rotate(-1)
-        return proxy
+        # Skip dead proxies. Rotate through the full cycle once; if every
+        # proxy is over the strike limit, return None (all proxies dead).
+        for _ in range(len(self.proxy_cycle)):
+            proxy = self.proxy_cycle[0]
+            self.proxy_cycle.rotate(-1)
+            if self._proxy_strikes.get(proxy, 0) < self._dead_proxy_strikes:
+                return proxy
+        return None
+
+    def _record_proxy_outcome(self, proxy_str: Optional[str], ok: bool) -> None:
+        """Track per-proxy success/failure in the SMTP verifier.
+        Proxy failures accumulate strikes; at _dead_proxy_strikes (default 3)
+        the proxy is skipped by _get_next_proxy. A single success resets
+        the strike count to zero.
+        """
+        if not proxy_str:
+            return
+        if ok:
+            with self.lock:
+                self._proxy_strikes.pop(proxy_str, None)
+        else:
+            with self.lock:
+                strikes = self._proxy_strikes.get(proxy_str, 0) + 1
+                self._proxy_strikes[proxy_str] = strikes
 
     def _has_proxies(self) -> bool:
         return bool(self.proxy_cycle)
@@ -1863,6 +1891,7 @@ class AsyncEmailVerifier:
                     except Exception as e:
                         logger.debug("[smtp_direct] proxy connect failed via %s: %s", proxy_url, e)
                         last_proxy_error = f"Proxy connection failed via {proxy_url}: {e.__class__.__name__}: {e}"
+                        self._record_proxy_outcome(proxy_url, ok=False)
                         # Try the next proxy rather than letting one bad
                         # proxy spoil this verification.
                         continue
@@ -1991,6 +2020,8 @@ class AsyncEmailVerifier:
                 # proxy issue -- rotate to the next proxy. Without proxies
                 # it's the host, so give up.
                 last_proxy_error = f"Connection to {host}:{port}{proxy_msg} timed out"
+                if proxy_url:
+                    self._record_proxy_outcome(proxy_url, ok=False)
                 if not proxy_url:
                     return None, last_proxy_error
                 continue
@@ -2000,6 +2031,8 @@ class AsyncEmailVerifier:
                 # Connection-refused is a definitive answer for the *host*
                 # if we are not going through a proxy. With proxies, try the
                 # next one before blaming the host.
+                if proxy_url:
+                    self._record_proxy_outcome(proxy_url, ok=False)
                 if not proxy_url:
                     return None, last_proxy_error
                 continue
@@ -3232,6 +3265,16 @@ class _SessionPool:
                             except ValueError:
                                 pass
 
+    def get_session_by_proxy(self, proxy_str: str) -> Optional[_PoolSession]:
+        """Return the session currently assigned to *proxy_str*, or None."""
+        if not proxy_str:
+            return None
+        with self._lock:
+            for s in self._sessions:
+                if s.proxy == proxy_str:
+                    return s
+            return None
+
     def stats(self) -> Dict[str, int]:
         with self._lock:
             return {
@@ -4304,7 +4347,20 @@ class AdvancedEmailScraper:
                     logger.warning("[proxy] every configured proxy is malformed; cannot assign")
                     return None
 
-            proxy_str = random.choice(live_proxies)
+            # Use the quality-scored session pool for weighted selection
+            # rather than random.choice. The pool picks the session with
+            # the highest (successes - failures) score, reinforcing proven
+            # identities -- exactly what Isaac was hinting at.
+            session_pool = getattr(self, '_session_pool', None)
+            if session_pool is not None:
+                session = session_pool.acquire()
+                pool_proxy = session.proxy if session else None
+                if pool_proxy and pool_proxy in live_proxies:
+                    proxy_str = pool_proxy
+                else:
+                    proxy_str = random.choice(live_proxies)
+            else:
+                proxy_str = random.choice(live_proxies)
             self.domain_proxy_map[base_domain] = proxy_str
         return {'http': proxy_str, 'https': proxy_str}
 
@@ -4320,6 +4376,13 @@ class AdvancedEmailScraper:
         if not proxy_str or not self._is_valid_proxy_str(proxy_str):
             logger.debug("[proxy] skipping outcome record for invalid proxy: %s", proxy_str)
             return
+        # Also report to the quality-scored session pool so the pool
+        # can retire persistently failing identities and promote good ones.
+        session_pool = getattr(self, '_session_pool', None)
+        if session_pool is not None:
+            session = session_pool.get_session_by_proxy(proxy_str)
+            if session is not None:
+                session_pool.report(session, ok)
         if ok:
             # One success forgives the strike streak (the upstream is
             # back). We deliberately don't decay slowly: a single OK
@@ -4344,10 +4407,11 @@ class AdvancedEmailScraper:
                         proxy_str, new_strikes, len(evicted),
                     )
 
-    def _is_valid_proxy_str(self, proxy_str: str) -> bool:
+    @staticmethod
+    def _is_valid_proxy_str(proxy_str: str) -> bool:
         """Validate a proxy string is well-formed.
 
-        Valid formats: ``scheme://host:port`` where scheme is http/https,
+        Valid formats: ``scheme://host:port`` where scheme is http/https/socks5/socks5h/socks4,
         host is a valid hostname or IP, and port is 1-65535.
 
         Returns True if valid, False otherwise.
@@ -4356,7 +4420,7 @@ class AdvancedEmailScraper:
             return False
         try:
             parsed = urlparse(proxy_str)
-            if not parsed.scheme or parsed.scheme not in ("http", "https"):
+            if not parsed.scheme or parsed.scheme not in ("http", "https", "socks5", "socks5h", "socks4"):
                 return False
             if not parsed.hostname:
                 return False
@@ -5587,25 +5651,20 @@ class AdvancedEmailScraper:
             with self.lock:
                 self._tier2_fail_counts[domain] = self._tier2_fail_counts.get(domain, 0) + 1
             logger.debug("[tier2] camoufox fetch failed for %s: %s", url, e)
-            # Reset the shared-browser cache on any fetch failure. If the
-            # underlying Firefox crashed (OOM-killed, internal Playwright
-            # error, dropped websocket), the reference on self points at a
-            # dead object -- subsequent calls would skip the re-launch
-            # guard (since it's not None) and immediately fail again at
-            # ``browser.new_page()``, permanently disabling Tier-2 for
-            # the rest of the scraper's lifetime. Drop the reference so
-            # the very next call re-launches a fresh browser. We can't
-            # cheaply distinguish "browser crashed" from "this one URL
-            # timed out", so we err toward conservatism and pay the
-            # 3-8 s relaunch on the next Tier-2 call after any failure.
-            with self._camoufox_lock:
-                if self._camoufox_ctx_mgr is not None:
-                    try:
-                        self._camoufox_ctx_mgr.__exit__(None, None, None)
-                    except Exception as _e:
-                        logger.debug("[tier2] camoufox ctx_mgr __exit__ failed: %s", _e, exc_info=True)
-                self._camoufox_ctx_mgr = None
-                self._camoufox_browser = None
+            # Only reset the shared browser on connection-level failures
+            # (crash, OOM, websocket drop), NOT on page-level timeouts.
+            # A page.goto() timeout means the browser is still healthy;
+            # resetting forces a costly 3-8s relaunch for no benefit.
+            is_page_timeout = isinstance(e, TimeoutError) or "timeout" in str(e).lower()
+            if not is_page_timeout:
+                with self._camoufox_lock:
+                    if self._camoufox_ctx_mgr is not None:
+                        try:
+                            self._camoufox_ctx_mgr.__exit__(None, None, None)
+                        except Exception as _e:
+                            logger.debug("[tier2] camoufox ctx_mgr __exit__ failed: %s", _e, exc_info=True)
+                    self._camoufox_ctx_mgr = None
+                    self._camoufox_browser = None
             return None
 
     def _detect_access_denied(self, html_content):
@@ -17260,6 +17319,7 @@ class _AuditTestBase(unittest.TestCase):
         s.crawl_queue = deque()
         s.queued_urls = set()
         s._QUEUE_SOFT_CAP = 100_000
+        s._session_pool = _SessionPool(proxies=s.proxies, size=4)
         return s
 
 
@@ -19923,6 +19983,8 @@ class TestSmokeProxyMethods(unittest.TestCase):
     def test_get_next_proxy_round_robin(self):
         verifier = AsyncEmailVerifier.__new__(AsyncEmailVerifier)
         verifier.proxy_cycle = deque(["p1", "p2"])
+        verifier._proxy_strikes = {}
+        verifier._dead_proxy_strikes = 3
         self.assertEqual(verifier._get_next_proxy(), "p1")
         self.assertEqual(verifier._get_next_proxy(), "p2")
         self.assertEqual(verifier._get_next_proxy(), "p1")
@@ -20938,13 +21000,16 @@ class TestAuditRegressionCriticalFixes(unittest.TestCase):
 
     # ---- Proxy string validation tests ----
     def test_is_valid_proxy_str_accepts_valid_formats(self):
-        """Proxy validation must accept well-formed http/https://host:port"""
+        """Proxy validation must accept well-formed http/https/socks://host:port"""
         scraper = AdvancedEmailScraper.__new__(AdvancedEmailScraper)
         self.assertTrue(scraper._is_valid_proxy_str("http://proxy.example.com:8080"))
         self.assertTrue(scraper._is_valid_proxy_str("https://proxy.example.com:3128"))
         self.assertTrue(scraper._is_valid_proxy_str("http://192.168.1.1:8080"))
         self.assertTrue(scraper._is_valid_proxy_str("http://10.0.0.1:80"))
         self.assertTrue(scraper._is_valid_proxy_str("http://proxy.example.com:65535"))
+        self.assertTrue(scraper._is_valid_proxy_str("socks5://proxy.example.com:1080"))
+        self.assertTrue(scraper._is_valid_proxy_str("socks5h://192.168.1.1:1080"))
+        self.assertTrue(scraper._is_valid_proxy_str("socks4://proxy.example.com:1080"))
 
     def test_is_valid_proxy_str_rejects_malformed(self):
         """Proxy validation must reject malformed proxy strings"""
@@ -21581,6 +21646,111 @@ class TestAuditRegressionCriticalFixes(unittest.TestCase):
                              "prose should not be corrupted")
 
 
+class TestSessionPoolLookup(unittest.TestCase):
+    """Tests for _SessionPool.get_session_by_proxy and wire-up."""
+
+    def test_get_session_by_proxy_returns_matching_session(self):
+        pool = _SessionPool(proxies=["http://p1:8080", "http://p2:8080"], size=2)
+        s1 = pool.acquire()
+        found = pool.get_session_by_proxy(s1.proxy)
+        self.assertIsNotNone(found)
+        self.assertEqual(found.proxy, s1.proxy)
+
+    def test_get_session_by_proxy_returns_none_for_unknown(self):
+        pool = _SessionPool(proxies=["http://p1:8080"], size=1)
+        self.assertIsNone(pool.get_session_by_proxy("http://unknown:9999"))
+
+    def test_get_session_by_proxy_none_on_empty_str(self):
+        pool = _SessionPool(proxies=None, size=2)
+        self.assertIsNone(pool.get_session_by_proxy(""))
+        self.assertIsNone(pool.get_session_by_proxy(None))
+
+    def test_session_pool_wired_into_assign_proxy(self):
+        """_assign_proxy_for_url must use _session_pool.acquire() when pool exists."""
+        s = AdvancedEmailScraper.__new__(AdvancedEmailScraper)
+        s.proxies = ["http://p1:8080", "http://p2:8080"]
+        s.lock = RLock()
+        s.domain_proxy_map = {}
+        s._proxy_strikes = {}
+        s._dead_proxy_strikes = 3
+        s._session_pool = _SessionPool(proxies=s.proxies, size=4)
+        result = s._assign_proxy_for_url("https://example.com")
+        self.assertIsNotNone(result)
+        self.assertIn("http://", result.get("https", ""))
+        stats = s._session_pool.stats()
+        self.assertGreater(stats["total"], 0)
+
+    def test_record_proxy_outcome_reports_to_session_pool(self):
+        """_record_proxy_outcome must call session_pool.report()."""
+        s = AdvancedEmailScraper.__new__(AdvancedEmailScraper)
+        s.proxies = ["http://p1:8080"]
+        s.lock = RLock()
+        s.domain_proxy_map = {}
+        s._proxy_strikes = {}
+        s._dead_proxy_strikes = 3
+        s._session_pool = _SessionPool(proxies=s.proxies, size=2)
+        proxy_dict = {"http": "http://p1:8080", "https": "http://p1:8080"}
+        s._record_proxy_outcome(proxy_dict, ok=False)
+        s._record_proxy_outcome(proxy_dict, ok=False)
+        s._record_proxy_outcome(proxy_dict, ok=True)
+        pool_session = s._session_pool.get_session_by_proxy("http://p1:8080")
+        self.assertIsNotNone(pool_session)
+        self.assertEqual(pool_session.failures, 0, "success resets failures")
+        self.assertGreaterEqual(pool_session.successes, 1, "success counted in pool")
+
+
+class TestSmtpVerifierProxyStrikes(unittest.TestCase):
+    """Tests for SMTP verifier per-proxy strike tracking."""
+
+    def test_get_next_proxy_skips_dead_proxies(self):
+        v = AsyncEmailVerifier.__new__(AsyncEmailVerifier)
+        v.proxy_cycle = deque(["p1", "p2", "p3"])
+        v._proxy_strikes = {"p1": 3, "p2": 0, "p3": 0}
+        v._dead_proxy_strikes = 3
+        v.lock = RLock()
+        # p1 is dead (strikes >= 3), should be skipped
+        first = v._get_next_proxy()
+        self.assertEqual(first, "p2", "dead proxy p1 must be skipped")
+        second = v._get_next_proxy()
+        self.assertEqual(second, "p3", "round-robin continues to p3 after p2")
+
+    def test_get_next_proxy_returns_none_when_all_dead(self):
+        v = AsyncEmailVerifier.__new__(AsyncEmailVerifier)
+        v.proxy_cycle = deque(["p1", "p2"])
+        v._proxy_strikes = {"p1": 3, "p2": 4}
+        v._dead_proxy_strikes = 3
+        v.lock = RLock()
+        self.assertIsNone(v._get_next_proxy(), "None when all proxies are dead")
+
+    def test_record_proxy_outcome_strikes_and_resets(self):
+        v = AsyncEmailVerifier.__new__(AsyncEmailVerifier)
+        v.proxies = []
+        v.proxy_cycle = deque()
+        v._proxy_strikes = {}
+        v._dead_proxy_strikes = 3
+        v.lock = RLock()
+        v._record_proxy_outcome("http://p1:8080", ok=False)
+        self.assertEqual(v._proxy_strikes.get("http://p1:8080"), 1)
+        v._record_proxy_outcome("http://p1:8080", ok=False)
+        self.assertEqual(v._proxy_strikes.get("http://p1:8080"), 2)
+        v._record_proxy_outcome("http://p1:8080", ok=True)
+        self.assertNotIn("http://p1:8080", v._proxy_strikes,
+                         "success must reset strikes")
+
+
+class TestProxyFileParsing(unittest.TestCase):
+    """Tests for proxy file validation and dedup."""
+
+    def test_static_validator_rejects_malformed(self):
+        self.assertFalse(AdvancedEmailScraper._is_valid_proxy_str("garbage"))
+        self.assertFalse(AdvancedEmailScraper._is_valid_proxy_str(""))
+        self.assertFalse(AdvancedEmailScraper._is_valid_proxy_str("http://noport"))
+
+    def test_static_validator_accepts_valid(self):
+        self.assertTrue(AdvancedEmailScraper._is_valid_proxy_str("http://p1:8080"))
+        self.assertTrue(AdvancedEmailScraper._is_valid_proxy_str("socks5://p1:1080"))
+
+
 def main():
     # Suppress the XMLParsedAsHTMLWarning from BeautifulSoup at runtime
     # rather than at import time (S1-L-9).
@@ -21988,7 +22158,26 @@ def main():
         proxies = []
         if args.proxies:
             try:
-                with open(args.proxies, 'r') as f: proxies = [line.strip() for line in f if line.strip()]
+                with open(args.proxies, 'r') as f:
+                    raw = [line.strip() for line in f if line.strip()]
+                # Dedup + basic format validation at parse time.
+                seen = set()
+                valid = []
+                for p in raw:
+                    if p in seen:
+                        continue
+                    seen.add(p)
+                    if not AdvancedEmailScraper._is_valid_proxy_str(p):
+                        logger.warning(f"Skipping malformed proxy entry: {p}")
+                        continue
+                    valid.append(p)
+                if len(valid) < len(raw):
+                    skipped = len(raw) - len(valid)
+                    logger.info(
+                        f"Proxy file: {len(valid)} valid / {len(raw)} total "
+                        f"({skipped} malformed or duplicate entries skipped)"
+                    )
+                proxies = valid
             except FileNotFoundError:
                 logger.error(f"Proxy file not found: {args.proxies}"); return
 
