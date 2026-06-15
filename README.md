@@ -67,16 +67,16 @@ python mailrake.py domains.txt
 You'll see an interactive menu:
 
 ```
-╔═══════════════════════════════════════════════════════╗
+╔════════════════════════════════════════════════════════╗
 ║              MailRake — Advanced Email Scraper         ║
-╠═══════════════════════════════════════════════════════╣
+╠════════════════════════════════════════════════════════╣
 ║  1. Run Email Scraper                                  ║
 ║  2. Configure Settings                                 ║
 ║  3. View/Edit Settings                                 ║
 ║  4. Manage History Database                            ║
 ║  5. View Statistics                                    ║
 ║  6. Exit                                               ║
-╚═══════════════════════════════════════════════════════╝
+╚════════════════════════════════════════════════════════╝
 ```
 
 Select option `1`, then:
